@@ -13,8 +13,8 @@ use crate::cfg::ConfigManager;
 use crate::image::ResolvedBlockImage;
 use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
-    CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxLaunchSource, SandboxListFilter,
-    SandboxMetadata, SandboxState, SandboxTimeoutAction,
+    CpuAffinityRequest, CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxLaunchSource,
+    SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
 };
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
@@ -54,6 +54,8 @@ impl From<OrchestratorError> for models::Error {
             }
             OrchestratorError::SandboxNotFound(id) => sandbox_not_found(id),
             OrchestratorError::InvalidSandboxState { .. } => Self::new(400, err.to_string()),
+            OrchestratorError::CpuAffinityDisabled => Self::new(403, err.to_string()),
+            OrchestratorError::InvalidCpuAffinityRequest { .. } => Self::new(400, err.to_string()),
             OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
                 operation,
@@ -842,6 +844,79 @@ impl Sandboxes<()> for ApiImpl {
         }
     }
 
+    async fn sandboxes_sandbox_id_cpu_affinity_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::SandboxesSandboxIdCpuAffinityPostPathParams,
+        body: &models::SandboxCpuAffinityRequest,
+    ) -> Result<SandboxesSandboxIdCpuAffinityPostResponse, ()> {
+        if ConfigManager::global_config().sandbox.cpu_affinity_enabled != 1 {
+            return Ok(
+                SandboxesSandboxIdCpuAffinityPostResponse::Status403_Forbidden(
+                    OrchestratorError::CpuAffinityDisabled.into(),
+                ),
+            );
+        }
+
+        let path_id = &path_params.sandbox_id;
+        let Ok(sandbox_id) = SandboxId::parse_str(path_id) else {
+            return Ok(
+                SandboxesSandboxIdCpuAffinityPostResponse::Status404_NotFound(sandbox_not_found(
+                    path_id,
+                )),
+            );
+        };
+        let request = CpuAffinityRequest {
+            vcpu: body.vcpu.clone(),
+            core: body.core.clone(),
+        };
+
+        match self
+            .orchestrator
+            .bind_sandbox_cpu_affinity(sandbox_id, request)
+            .await
+        {
+            Ok(outcome) => Ok(SandboxesSandboxIdCpuAffinityPostResponse::Status200_CPUAffinityAppliedAndVerifiedSuccessfully(
+                models::SandboxCpuAffinity::new(
+                    path_id.clone(),
+                    outcome.vcpu,
+                    outcome.cores,
+                    outcome.ignored_offline_cores,
+                    outcome.bound_thread_count,
+                ),
+            )),
+            Err(OrchestratorError::SandboxNotFound(id)) => Ok(
+                SandboxesSandboxIdCpuAffinityPostResponse::Status404_NotFound(sandbox_not_found(
+                    id,
+                )),
+            ),
+            Err(err @ OrchestratorError::InvalidCpuAffinityRequest { .. }) => {
+                Ok(SandboxesSandboxIdCpuAffinityPostResponse::Status400_BadRequest(err.into()))
+            }
+            Err(
+                err @ (OrchestratorError::InvalidSandboxState { .. }
+                | OrchestratorError::SandboxOperationConflict { .. }),
+            ) => Ok(
+                SandboxesSandboxIdCpuAffinityPostResponse::Status409_Conflict(Self::error(
+                    409,
+                    err.to_string(),
+                )),
+            ),
+            Err(err @ OrchestratorError::CpuAffinityDisabled) => {
+                Ok(SandboxesSandboxIdCpuAffinityPostResponse::Status403_Forbidden(err.into()))
+            }
+            Err(err @ OrchestratorError::ShuttingDown) => Ok(
+                SandboxesSandboxIdCpuAffinityPostResponse::Status503_ServiceUnavailable(err.into()),
+            ),
+            Err(err) => {
+                Ok(SandboxesSandboxIdCpuAffinityPostResponse::Status500_ServerError(err.into()))
+            }
+        }
+    }
+
     async fn sandboxes_sandbox_id_fork_post(
         &self,
         _method: &Method,
@@ -1460,6 +1535,25 @@ impl Sandboxes<()> for ApiImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_affinity_errors_have_stable_http_codes() {
+        let disabled = models::Error::from(OrchestratorError::CpuAffinityDisabled);
+        assert_eq!(disabled.code, 403);
+        assert_eq!(
+            disabled.message,
+            "sandbox CPU affinity API is disabled on this node"
+        );
+
+        let invalid = models::Error::from(OrchestratorError::InvalidCpuAffinityRequest {
+            message: "bad cpu list".to_string(),
+        });
+        assert_eq!(invalid.code, 400);
+        assert!(invalid.message.contains("bad cpu list"));
+
+        let shutting_down = models::Error::from(OrchestratorError::ShuttingDown);
+        assert_eq!(shutting_down.code, 503);
+    }
 
     #[test]
     fn parse_metadata_filter_with_none_returns_none() {

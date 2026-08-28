@@ -9,6 +9,8 @@ mod types;
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
+pub use crate::sandbox::{CpuAffinityOutcome, CpuAffinityRequest};
+
 pub use metrics::OrchestratorMetrics;
 pub use persistence::{
     DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
@@ -39,6 +41,7 @@ pub enum SandboxOperation {
     Fork,
     UpdateNetwork,
     PatchCustomExtensionParams,
+    BindCpuAffinity,
     Stop,
 }
 
@@ -81,6 +84,12 @@ pub enum OrchestratorError {
         sandbox_id: SandboxId,
         operation: SandboxOperation,
     },
+
+    #[error("sandbox CPU affinity API is disabled on this node")]
+    CpuAffinityDisabled,
+
+    #[error("invalid sandbox CPU affinity request: {message}")]
+    InvalidCpuAffinityRequest { message: String },
 
     #[error("store operation failed: {0}")]
     StoreOperationFailed(#[source] store::StoreError),

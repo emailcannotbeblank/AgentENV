@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{sync::Mutex, thread};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use tokio::time::sleep;
 
@@ -338,6 +338,10 @@ impl SandboxBackend for MockSandboxBackend {
 
     fn runtime_info(&self) -> SandboxRuntimeInfo {
         self.behavior.runtime_info()
+    }
+
+    fn runtime_process_id(&self) -> Result<i32> {
+        i32::try_from(std::process::id()).context("mock runtime pid does not fit in i32")
     }
 
     fn startup_artifacts(&self) -> RuntimeArtifactSet {

@@ -277,6 +277,10 @@ pub struct SandboxConfig {
         parse_env = parse_trimmed_string
     )]
     pub access_token_hash_seed: Option<String>,
+    /// Enables the runtime CPU-affinity node API.
+    /// This is a strict 0/1 value rather than a truthy integer.
+    #[config(default = 1u8)]
+    pub cpu_affinity_enabled: u8,
 }
 
 impl std::fmt::Debug for SandboxConfig {
@@ -286,6 +290,7 @@ impl std::fmt::Debug for SandboxConfig {
                 "access_token_hash_seed",
                 &self.access_token_hash_seed.as_ref().map(|_| "<redacted>"),
             )
+            .field("cpu_affinity_enabled", &self.cpu_affinity_enabled)
             .finish()
     }
 }
@@ -930,6 +935,12 @@ impl AppConfig {
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
+        if self.sandbox.cpu_affinity_enabled > 1 {
+            bail!(
+                "invalid sandbox.cpu_affinity_enabled: expected 0 or 1, got {}",
+                self.sandbox.cpu_affinity_enabled
+            );
+        }
         Ok(())
     }
 
@@ -1359,8 +1370,23 @@ mod tests {
     fn sandbox_access_token_seed_is_redacted() {
         let config = SandboxConfig {
             access_token_hash_seed: Some("cluster-secret".to_string()),
+            ..Default::default()
         };
         assert!(!format!("{config:?}").contains("cluster-secret"));
+    }
+
+    #[test]
+    fn cpu_affinity_switch_accepts_only_zero_or_one() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.sandbox.cpu_affinity_enabled, 1);
+
+        for value in [0, 1] {
+            config.sandbox.cpu_affinity_enabled = value;
+            assert!(config.validate().is_ok(), "value {value} should be valid");
+        }
+
+        config.sandbox.cpu_affinity_enabled = 2;
+        assert!(config.validate().is_err(), "value 2 should be rejected");
     }
 
     #[test]

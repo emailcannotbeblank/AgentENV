@@ -1,5 +1,5 @@
 use super::{handle_status, Client};
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
@@ -72,6 +72,24 @@ pub struct ListedSandbox {
     pub end_at: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct SandboxCpuAffinityRequest<'a> {
+    vcpu: &'a str,
+    core: &'a str,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SandboxCpuAffinity {
+    #[serde(rename = "sandboxID")]
+    pub sandbox_id: String,
+    pub vcpu: String,
+    pub cores: String,
+    #[serde(rename = "ignoredOfflineCores")]
+    pub ignored_offline_cores: String,
+    #[serde(rename = "boundThreadCount")]
+    pub bound_thread_count: u32,
+}
+
 impl Client {
     pub fn create_sandbox(
         &self,
@@ -126,6 +144,26 @@ impl Client {
         Ok(())
     }
 
+    pub fn bind_cpu_affinity(
+        &self,
+        id: &str,
+        vcpu: &str,
+        core: &str,
+    ) -> Result<SandboxCpuAffinity> {
+        let body = SandboxCpuAffinityRequest { vcpu, core };
+        let resp = handle_status(
+            self.post(&format!("/sandboxes/{id}/cpu-affinity"))
+                .send_json(&body),
+        )?;
+        let result: SandboxCpuAffinity = resp.into_json()?;
+        ensure!(
+            result.sandbox_id == id,
+            "CPU affinity response sandbox mismatch: requested {id}, got {}",
+            result.sandbox_id
+        );
+        Ok(result)
+    }
+
     pub fn sandbox_state_with_timeout(
         &self,
         id: &str,
@@ -178,7 +216,58 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::{NewColdSandbox, NewSandbox, RefreshSandbox};
+    use super::{NewColdSandbox, NewSandbox, RefreshSandbox, SandboxCpuAffinity};
+    use crate::client::Client;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    fn serve_json_once(response_body: &'static str) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let _ = request_tx.send(String::from_utf8(request).unwrap());
+
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .unwrap();
+        });
+        (format!("http://{address}"), request_rx)
+    }
 
     #[test]
     fn new_sandbox_serializes_template_start() {
@@ -228,5 +317,32 @@ mod tests {
 
         let empty = serde_json::to_value(RefreshSandbox { duration: None }).unwrap();
         assert!(empty.get("duration").is_none());
+    }
+
+    #[test]
+    fn bind_cpu_affinity_uses_expected_http_contract() {
+        let (url, request) = serve_json_once(
+            r#"{"sandboxID":"sandbox-1","vcpu":"*","cores":"2-3","ignoredOfflineCores":"","boundThreadCount":4}"#,
+        );
+        let client = Client::new(&url, "secret-key").unwrap();
+        let result = client.bind_cpu_affinity("sandbox-1", "*", "2-3").unwrap();
+        assert_eq!(
+            result,
+            SandboxCpuAffinity {
+                sandbox_id: "sandbox-1".into(),
+                vcpu: "*".into(),
+                cores: "2-3".into(),
+                ignored_offline_cores: String::new(),
+                bound_thread_count: 4,
+            }
+        );
+
+        let request = request.recv().unwrap();
+        assert!(request.starts_with("POST /sandboxes/sandbox-1/cpu-affinity HTTP/1.1\r\n"));
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            serde_json::json!({"vcpu": "*", "core": "2-3"})
+        );
     }
 }

@@ -15,6 +15,7 @@ use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
 use crate::sandbox::{
+    bind_process_cpu_affinity, CpuAffinityError, CpuAffinityOutcome, CpuAffinityRequest,
     CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerSandboxFactory,
     FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxAccessTokenGenerator,
     SandboxBackend, SandboxBackendFactory, SandboxForkSpec, SandboxLaunchConfig,
@@ -107,6 +108,7 @@ pub struct Orchestrator<
     shutdown_outcome: OnceCell<ShutdownOutcome>,
     image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
+    cpu_affinity_enabled: bool,
 }
 
 impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
@@ -197,6 +199,7 @@ where
             shutdown_outcome: OnceCell::new(),
             image_refs,
             access_tokens,
+            cpu_affinity_enabled: app_config.sandbox.cpu_affinity_enabled == 1,
         });
 
         // Start the auto-evict task.
@@ -706,6 +709,105 @@ where
     #[tracing::instrument(skip(self), fields(sandbox_id = %sandbox_id))]
     pub async fn get_sandbox(&self, sandbox_id: &SandboxId) -> Result<Option<SandboxMetadata>> {
         Ok(self.store.get(sandbox_id).await?)
+    }
+
+    /// Bind selected threads of a running Firecracker process to host CPUs.
+    pub async fn bind_sandbox_cpu_affinity(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        request: CpuAffinityRequest,
+    ) -> Result<CpuAffinityOutcome> {
+        self.ensure_cpu_affinity_enabled()?;
+        self.ensure_accepting_lifecycle_operations()?;
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("bind_cpu_affinity", sandbox_id, async move {
+            this.bind_sandbox_cpu_affinity_inner(sandbox_id, request)
+                .await
+        })
+        .await
+    }
+
+    async fn bind_sandbox_cpu_affinity_inner(
+        &self,
+        sandbox_id: SandboxId,
+        request: CpuAffinityRequest,
+    ) -> Result<CpuAffinityOutcome> {
+        let metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        if metadata.state != SandboxState::Running {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id,
+                state: metadata.state,
+            });
+        }
+
+        let handle = self
+            .sandboxes
+            .read()
+            .await
+            .get(&sandbox_id)
+            .cloned()
+            .ok_or(OrchestratorError::SandboxOperationConflict {
+                sandbox_id,
+                operation: SandboxOperation::BindCpuAffinity,
+            })?;
+        let sandbox = handle.lock().await;
+        let metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        if metadata.state != SandboxState::Running {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id,
+                state: metadata.state,
+            });
+        }
+        let pid = sandbox.runtime_process_id().map_err(|source| {
+            OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: SandboxOperation::BindCpuAffinity,
+                source,
+            }
+        })?;
+
+        // Hold the backend lock while the blocking operation runs so pause,
+        // snapshot and delete cannot replace the Firecracker process midway.
+        let outcome = tokio::task::spawn_blocking(move || bind_process_cpu_affinity(pid, request))
+            .await
+            .map_err(|source| OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: SandboxOperation::BindCpuAffinity,
+                source: anyhow::Error::new(source).context("join CPU affinity worker"),
+            })?;
+
+        match outcome {
+            Ok(outcome) => {
+                info!(
+                    sandbox_id = %sandbox_id,
+                    firecracker_pid = pid,
+                    vcpu = %outcome.vcpu,
+                    cores = %outcome.cores,
+                    ignored_offline_cores = %outcome.ignored_offline_cores,
+                    bound_thread_count = outcome.bound_thread_count,
+                    "bound sandbox CPU affinity"
+                );
+                Ok(outcome)
+            }
+            Err(CpuAffinityError::InvalidRequest(message)) => {
+                Err(OrchestratorError::InvalidCpuAffinityRequest { message })
+            }
+            Err(CpuAffinityError::Operation(source)) => {
+                Err(OrchestratorError::SandboxOperationFailed {
+                    sandbox_id,
+                    operation: SandboxOperation::BindCpuAffinity,
+                    source,
+                })
+            }
+        }
     }
 
     /// Lists all sandboxes with their metadata.
@@ -2527,6 +2629,14 @@ where
         }
 
         Ok(())
+    }
+
+    fn ensure_cpu_affinity_enabled(&self) -> Result<()> {
+        if self.cpu_affinity_enabled {
+            Ok(())
+        } else {
+            Err(OrchestratorError::CpuAffinityDisabled)
+        }
     }
 }
 

@@ -101,6 +101,19 @@ fn make_orchestrator_without_background_with_factory_and_persister<
     factory: F,
     persister: P,
 ) -> Arc<TestOrchestrator<S, F, P>> {
+    make_orchestrator_without_background_with_cpu_affinity(store, factory, persister, false)
+}
+
+fn make_orchestrator_without_background_with_cpu_affinity<
+    S: MetadataStore + 'static,
+    F: SandboxBackendFactory,
+    P: SandboxPersister + 'static,
+>(
+    store: S,
+    factory: F,
+    persister: P,
+    cpu_affinity_enabled: bool,
+) -> Arc<TestOrchestrator<S, F, P>> {
     let (sandbox_event_tx, _sandbox_event_rx) =
         tokio::sync::broadcast::channel(SANDBOX_EVENT_CHANNEL_CAPACITY);
     Arc::new(Orchestrator {
@@ -118,6 +131,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         shutdown_outcome: tokio::sync::OnceCell::new(),
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
+        cpu_affinity_enabled,
     })
 }
 
@@ -835,6 +849,90 @@ fn paused_resume_metadata(sandbox_id: SandboxId) -> SandboxMetadata {
         paused_state: Some(test_paused_state().clone()),
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn cpu_affinity_switch_rejects_before_sandbox_lookup() {
+    let orchestrator = make_orchestrator_without_background_with_cpu_affinity(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        false,
+    );
+    let sandbox_id = SandboxId::new();
+
+    assert!(matches!(
+        orchestrator
+            .bind_sandbox_cpu_affinity(
+                sandbox_id,
+                CpuAffinityRequest {
+                    vcpu: "*".to_string(),
+                    core: "0".to_string(),
+                },
+            )
+            .await,
+        Err(OrchestratorError::CpuAffinityDisabled)
+    ));
+
+    let enabled = make_orchestrator_without_background_with_cpu_affinity(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        true,
+    );
+    enabled.is_shutting_down.store(true, Ordering::Release);
+    assert!(matches!(
+        enabled
+            .bind_sandbox_cpu_affinity(
+                sandbox_id,
+                CpuAffinityRequest {
+                    vcpu: "*".to_string(),
+                    core: "0".to_string(),
+                },
+            )
+            .await,
+        Err(OrchestratorError::ShuttingDown)
+    ));
+}
+
+#[tokio::test]
+async fn oversized_cpu_affinity_request_is_invalid() {
+    let orchestrator = make_orchestrator_without_background_with_cpu_affinity(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        true,
+    );
+    let sandbox_id = SandboxId::new();
+
+    orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Running)
+        .await
+        .unwrap();
+
+    let handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(Arc::new(
+        MockBehavior::new(),
+    )))));
+    orchestrator
+        .sandboxes
+        .write()
+        .await
+        .insert(sandbox_id, handle);
+
+    let error = orchestrator
+        .bind_sandbox_cpu_affinity(
+            sandbox_id,
+            CpuAffinityRequest {
+                vcpu: "*".repeat(16 * 1024 + 1),
+                core: "0".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        OrchestratorError::InvalidCpuAffinityRequest { .. }
+    ));
 }
 
 /// The expected `OrchestratorMetrics` snapshot for a state in which a single
