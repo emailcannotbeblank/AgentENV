@@ -838,6 +838,69 @@ fn paused_resume_metadata(sandbox_id: SandboxId) -> SandboxMetadata {
     }
 }
 
+#[tokio::test]
+async fn cpu_affinity_rejects_when_shutting_down() {
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+    );
+    let sandbox_id = SandboxId::new();
+
+    orchestrator.is_shutting_down.store(true, Ordering::Release);
+    assert!(matches!(
+        orchestrator
+            .bind_sandbox_cpu_affinity(
+                sandbox_id,
+                CpuAffinityRequest {
+                    vcpu: "*".to_string(),
+                    core: "0".to_string(),
+                },
+            )
+            .await,
+        Err(OrchestratorError::ShuttingDown)
+    ));
+}
+
+#[tokio::test]
+async fn oversized_cpu_affinity_request_is_invalid() {
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+    );
+    let sandbox_id = SandboxId::new();
+
+    orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Running)
+        .await
+        .unwrap();
+
+    let handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(Arc::new(
+        MockBehavior::new(),
+    )))));
+    orchestrator
+        .sandboxes
+        .write()
+        .await
+        .insert(sandbox_id, handle);
+
+    let error = orchestrator
+        .bind_sandbox_cpu_affinity(
+            sandbox_id,
+            CpuAffinityRequest {
+                vcpu: "*".repeat(16 * 1024 + 1),
+                core: "0".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        OrchestratorError::InvalidCpuAffinityRequest { .. }
+    ));
+}
+
 /// The expected `OrchestratorMetrics` snapshot for a state in which a single
 /// `SandboxMetadata::default()`-shaped paused sandbox is the only entry in the
 /// store: no active running / starting contributions, and one Paused sandbox
