@@ -876,9 +876,9 @@ async fn oversized_cpu_affinity_request_is_invalid() {
         .await
         .unwrap();
 
-    let handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(Arc::new(
-        MockBehavior::new(),
-    )))));
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_runtime_process_id(i32::MAX);
+    let handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(behavior))));
     orchestrator
         .sandboxes
         .write()
@@ -899,6 +899,49 @@ async fn oversized_cpu_affinity_request_is_invalid() {
         error,
         OrchestratorError::InvalidCpuAffinityRequest { .. }
     ));
+}
+
+#[tokio::test]
+async fn mock_cpu_affinity_does_not_target_the_test_process() {
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+    );
+    let sandbox_id = SandboxId::new();
+
+    orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Running)
+        .await
+        .unwrap();
+
+    let handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(Arc::new(
+        MockBehavior::new(),
+    )))));
+    orchestrator
+        .sandboxes
+        .write()
+        .await
+        .insert(sandbox_id, handle);
+
+    let error = orchestrator
+        .bind_sandbox_cpu_affinity(
+            sandbox_id,
+            CpuAffinityRequest {
+                vcpu: "*".to_string(),
+                core: "0".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        OrchestratorError::SandboxOperationFailed {
+            operation: SandboxOperation::BindCpuAffinity,
+            ..
+        }
+    ));
+    assert!(format!("{error:#}").contains("mock sandbox backend has no runtime process"));
 }
 
 /// The expected `OrchestratorMetrics` snapshot for a state in which a single

@@ -904,7 +904,7 @@ where
                 sandbox_id,
                 operation,
             })?;
-        let sandbox = handle.lock().await;
+        let mut sandbox = handle.lock().await;
         let metadata = self
             .store
             .get(&sandbox_id)
@@ -916,6 +916,11 @@ where
                 state: metadata.state,
             });
         }
+        // The sandbox-level lock stays held until the blocking operation
+        // finishes. `runtime_process_id` also polls the owned child before
+        // returning its PID, so an already-exited Firecracker is rejected and
+        // an exit after this point remains unreaped (and therefore cannot have
+        // its PID reused) for the duration of this operation.
         let pid = sandbox.runtime_process_id().map_err(|source| {
             OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
@@ -931,6 +936,7 @@ where
                 operation,
                 source: anyhow::Error::new(source).context("join CPU affinity worker"),
             })?;
+        drop(sandbox);
         match outcome {
             Ok(value) => Ok((pid, value)),
             Err(CpuAffinityError::InvalidRequest(message)) => {

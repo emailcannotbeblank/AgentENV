@@ -263,7 +263,10 @@ pub trait SandboxBackend: Send + 'static {
     fn runtime_info(&self) -> SandboxRuntimeInfo;
 
     /// Return the host PID of the process implementing this running sandbox.
-    fn runtime_process_id(&self) -> Result<i32>;
+    ///
+    /// Implementations may poll the owned child process while resolving the
+    /// PID, so callers must hold the sandbox handle exclusively.
+    fn runtime_process_id(&mut self) -> Result<i32>;
 
     /// Local runtime artifacts this sandbox opens on start.
     fn startup_artifacts(&self) -> RuntimeArtifactSet;

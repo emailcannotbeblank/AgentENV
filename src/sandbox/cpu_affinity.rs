@@ -145,6 +145,18 @@ pub(crate) fn bind_process(
     let threads = list_threads(pid)
         .with_context(|| format!("failed to enumerate threads of Firecracker pid {pid}"))
         .map_err(CpuAffinityError::Operation)?;
+    let process = threads
+        .iter()
+        .find(|thread| thread.tid == pid)
+        .ok_or_else(|| {
+            CpuAffinityError::Operation(anyhow!(
+                "Firecracker pid {pid} has no process-leader thread"
+            ))
+        })?;
+    process
+        .verify_identity(pid)
+        .context("failed to verify Firecracker process identity")
+        .map_err(CpuAffinityError::Operation)?;
     let targets = select_threads(pid, &vcpu, &threads)?;
 
     // nix::CpuSet wraps libc's fixed-size cpu_set_t. On supported Linux
@@ -187,7 +199,7 @@ pub(crate) fn bind_process(
     }
 
     let cores = format_cpu_list(&cores);
-    bind_threads(pid, &targets, &desired, &cores).map_err(CpuAffinityError::Operation)?;
+    bind_threads(pid, process, &targets, &desired, &cores).map_err(CpuAffinityError::Operation)?;
     let bound_thread_count = u32::try_from(targets.len())
         .context("bound thread count does not fit in u32")
         .map_err(CpuAffinityError::Operation)?;
@@ -456,16 +468,37 @@ fn format_cpu_set(set: &CpuSet) -> String {
 
 /// Apply affinity as a best-effort transaction: preflight every target, update
 /// one by one, verify the result, and roll back earlier updates on failure.
-fn bind_threads(pid: i32, targets: &[&ThreadInfo], desired: &CpuSet, cores: &str) -> Result<()> {
-    let originals: Vec<(&ThreadInfo, CpuSet)> = targets
-        .iter()
-        .map(|&thread| thread.read_affinity(pid).map(|original| (thread, original)))
-        .collect::<Result<_>>()?;
+fn bind_threads(
+    pid: i32,
+    process: &ThreadInfo,
+    targets: &[&ThreadInfo],
+    desired: &CpuSet,
+    cores: &str,
+) -> Result<()> {
+    let mut originals = Vec::with_capacity(targets.len());
+    for &thread in targets {
+        process
+            .verify_identity(pid)
+            .context("Firecracker process identity changed during affinity preflight")?;
+        originals.push((thread, thread.read_affinity(pid)?));
+        process
+            .verify_identity(pid)
+            .context("Firecracker process identity changed during affinity preflight")?;
+    }
 
     for (index, (thread, _)) in originals.iter().enumerate() {
+        if let Err(error) = process.verify_identity(pid) {
+            return Err(error_after_rollback(
+                pid,
+                process,
+                format!("Firecracker process identity check failed: {error:#}"),
+                &originals[..index],
+            ));
+        }
         if let Err(error) = thread.verify_identity(pid) {
             return Err(error_after_rollback(
                 pid,
+                process,
                 format!("thread identity check failed: {error:#}"),
                 &originals[..index],
             ));
@@ -473,6 +506,7 @@ fn bind_threads(pid: i32, targets: &[&ThreadInfo], desired: &CpuSet, cores: &str
         if let Err(error) = sched_setaffinity(Pid::from_raw(thread.tid), desired) {
             return Err(error_after_rollback(
                 pid,
+                process,
                 format!(
                     "failed to bind tid={} ({:?}) to cores {cores}: {error}",
                     thread.tid, thread.comm
@@ -487,6 +521,7 @@ fn bind_threads(pid: i32, targets: &[&ThreadInfo], desired: &CpuSet, cores: &str
             Err(error) => {
                 return Err(error_after_rollback(
                     pid,
+                    process,
                     format!(
                         "bound tid={} ({:?}) but failed to verify its affinity: {error:#}",
                         thread.tid, thread.comm
@@ -498,6 +533,7 @@ fn bind_threads(pid: i32, targets: &[&ThreadInfo], desired: &CpuSet, cores: &str
         if actual != *desired {
             return Err(error_after_rollback(
                 pid,
+                process,
                 format!(
                     "kernel restricted affinity of tid={} ({:?}): requested {cores}, actual {}",
                     thread.tid,
@@ -507,12 +543,21 @@ fn bind_threads(pid: i32, targets: &[&ThreadInfo], desired: &CpuSet, cores: &str
                 &originals[..applied],
             ));
         }
+        if let Err(error) = process.verify_identity(pid) {
+            return Err(error_after_rollback(
+                pid,
+                process,
+                format!("Firecracker process identity check failed: {error:#}"),
+                &originals[..applied],
+            ));
+        }
     }
     Ok(())
 }
 
 fn error_after_rollback(
     pid: i32,
+    process: &ThreadInfo,
     reason: String,
     applied: &[(&ThreadInfo, CpuSet)],
 ) -> anyhow::Error {
@@ -520,8 +565,18 @@ fn error_after_rollback(
         return anyhow!("{reason}; no affinity changes were applied");
     }
 
+    if let Err(error) = process.verify_identity(pid) {
+        return anyhow!(
+            "{reason}; rollback skipped because Firecracker process identity check failed: {error:#}"
+        );
+    }
+
     let mut failures = Vec::new();
     for (thread, original) in applied.iter().rev() {
+        if let Err(error) = process.verify_identity(pid) {
+            failures.push(format!("process identity check failed: {error:#}"));
+            break;
+        }
         if let Err(error) = thread.verify_identity(pid) {
             failures.push(format!(
                 "tid={} (identity check failed: {error:#})",
@@ -713,9 +768,16 @@ mod tests {
     #[test]
     fn incomplete_rollback_reports_the_affected_tid() {
         let pid = i32::try_from(std::process::id()).unwrap();
+        let threads = list_threads(pid).unwrap();
+        let process = threads.iter().find(|thread| thread.tid == pid).unwrap();
         let missing = thread(i32::MAX, "exited-thread");
         let original = CpuSet::new();
-        let error = error_after_rollback(pid, "apply failed".to_string(), &[(&missing, original)]);
+        let error = error_after_rollback(
+            pid,
+            process,
+            "apply failed".to_string(),
+            &[(&missing, original)],
+        );
         let message = error.to_string();
         assert!(message.contains("rollback incomplete"));
         assert!(message.contains(&format!("tid={}", missing.tid)));
@@ -764,6 +826,7 @@ mod tests {
                 )
             })
             .collect();
+        let process = threads.iter().find(|thread| thread.tid == pid).unwrap();
         let cpu = (0..CpuSet::count())
             .find(|&cpu| originals.iter().all(|(_, set)| set.is_set(cpu) == Ok(true)))
             .expect("child threads should share at least one allowed CPU");
@@ -778,7 +841,7 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.bound_thread_count as usize, originals.len());
 
-        let rollback = error_after_rollback(pid, "test rollback".to_string(), &originals);
+        let rollback = error_after_rollback(pid, process, "test rollback".to_string(), &originals);
         assert!(rollback.to_string().contains("rolled back"));
         for (thread, original) in originals {
             assert_eq!(
