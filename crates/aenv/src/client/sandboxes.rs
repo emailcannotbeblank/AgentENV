@@ -1,5 +1,5 @@
 use super::{handle_status, Client};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -156,6 +156,9 @@ impl Client {
         vcpu: &str,
         core: &str,
     ) -> Result<SandboxCpuAffinity> {
+        let id = uuid::Uuid::parse_str(id)
+            .with_context(|| format!("invalid sandbox ID {id:?}"))?
+            .to_string();
         let body = SandboxCpuAffinityRequest { vcpu, core };
         let resp = handle_status(
             self.post(&format!("/sandboxes/{id}/cpu-affinity"))
@@ -330,14 +333,16 @@ mod tests {
     #[test]
     fn bind_cpu_affinity_uses_expected_http_contract() {
         let (url, request) = serve_json_once(
-            r#"{"sandboxID":"sandbox-1","vcpu":"*","cores":"2-3","ignoredOfflineCores":"","boundThreadCount":4}"#,
+            r#"{"sandboxID":"01936f8e-72f5-7000-8000-0000000000ab","vcpu":"*","cores":"2-3","ignoredOfflineCores":"","boundThreadCount":4}"#,
         );
         let client = Client::new(&url, "secret-key").unwrap();
-        let result = client.bind_cpu_affinity("sandbox-1", "*", "2-3").unwrap();
+        let result = client
+            .bind_cpu_affinity("01936F8E-72F5-7000-8000-0000000000AB", "*", "2-3")
+            .unwrap();
         assert_eq!(
             result,
             SandboxCpuAffinity {
-                sandbox_id: "sandbox-1".into(),
+                sandbox_id: "01936f8e-72f5-7000-8000-0000000000ab".into(),
                 vcpu: "*".into(),
                 cores: "2-3".into(),
                 ignored_offline_cores: String::new(),
@@ -346,11 +351,23 @@ mod tests {
         );
 
         let request = request.recv().unwrap();
-        assert!(request.starts_with("POST /sandboxes/sandbox-1/cpu-affinity HTTP/1.1\r\n"));
+        assert!(request.starts_with(
+            "POST /sandboxes/01936f8e-72f5-7000-8000-0000000000ab/cpu-affinity HTTP/1.1\r\n"
+        ));
         let body = request.split_once("\r\n\r\n").unwrap().1;
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(body).unwrap(),
             serde_json::json!({"vcpu": "*", "core": "2-3"})
         );
+    }
+
+    #[test]
+    fn bind_cpu_affinity_rejects_path_special_sandbox_ids() {
+        let client = Client::new("http://127.0.0.1:1", "secret-key").unwrap();
+
+        for id in ["sandbox/other", "sandbox?admin=true"] {
+            let error = client.bind_cpu_affinity(id, "*", "0").unwrap_err();
+            assert!(error.to_string().contains("invalid sandbox ID"));
+        }
     }
 }
