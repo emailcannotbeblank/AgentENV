@@ -904,7 +904,7 @@ where
                 sandbox_id,
                 operation,
             })?;
-        let mut sandbox = handle.lock().await;
+        let mut sandbox = handle.lock_owned().await;
         let metadata = self
             .store
             .get(&sandbox_id)
@@ -916,27 +916,27 @@ where
                 state: metadata.state,
             });
         }
-        // The sandbox-level lock stays held until the blocking operation
-        // finishes. `runtime_process_id` also polls the owned child before
-        // returning its PID, so an already-exited Firecracker is rejected and
-        // an exit after this point remains unreaped (and therefore cannot have
-        // its PID reused) for the duration of this operation.
-        let pid = sandbox.runtime_process_id().map_err(|source| {
-            OrchestratorError::SandboxOperationFailed {
+        // Move the owned sandbox guard into the blocking worker so the backend
+        // and its child process outlive the affinity operation even if the
+        // awaiting async task is dropped during runtime shutdown.
+        let worker_result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let pid = sandbox.runtime_process_id()?;
+            let outcome = run(pid);
+            drop(sandbox);
+            Ok((pid, outcome))
+        })
+        .await
+        .map_err(|source| OrchestratorError::SandboxOperationFailed {
+            sandbox_id,
+            operation,
+            source: anyhow::Error::new(source).context("join CPU affinity worker"),
+        })?;
+        let (pid, outcome) =
+            worker_result.map_err(|source| OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
                 operation,
                 source,
-            }
-        })?;
-
-        let outcome = tokio::task::spawn_blocking(move || run(pid))
-            .await
-            .map_err(|source| OrchestratorError::SandboxOperationFailed {
-                sandbox_id,
-                operation,
-                source: anyhow::Error::new(source).context("join CPU affinity worker"),
             })?;
-        drop(sandbox);
         match outcome {
             Ok(value) => Ok((pid, value)),
             Err(CpuAffinityError::InvalidRequest(message)) => {
