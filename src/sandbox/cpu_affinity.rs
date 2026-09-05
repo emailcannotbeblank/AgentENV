@@ -145,6 +145,11 @@ struct StoppedThreadGroup {
 
 impl StoppedThreadGroup {
     fn stop(pid: i32) -> Result<Self> {
+        let threads = list_threads(pid)?;
+        if threads.iter().any(ThreadInfo::is_stopped) {
+            bail!("Firecracker pid {pid} is already stopped");
+        }
+
         let pid = Pid::from_raw(pid);
         kill(pid, Signal::SIGSTOP)
             .with_context(|| format!("failed to send SIGSTOP to Firecracker pid {pid}"))?;
