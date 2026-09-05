@@ -250,6 +250,9 @@ platform affinity mask. Offline requested CPUs are ignored; if the remaining
 online set is empty, the request fails before making changes.
 
 Affinity applies to the current Firecracker process and its current threads.
+To prevent a thread ID from being reused during the update, AgentENV briefly
+stops the complete Firecracker process and resumes it as soon as the update
+finishes or fails.
 Reapply it after a pause and resume, which replaces the runtime process. The
 operation is exposed through the admin API because incorrect placement can
 affect other workloads on the node. It uses the deployment API key and has no

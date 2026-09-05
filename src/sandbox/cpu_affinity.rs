@@ -1,20 +1,25 @@
 //! Runtime CPU-affinity control for a Firecracker process.
 //!
 //! This module scans procfs, validates bounded CPU lists with ranges and
-//! optional strides, applies affinity one thread at a time, verifies every
-//! write, and restores earlier changes when a later write fails.
+//! optional strides, stops the complete Firecracker thread group while numeric
+//! TIDs are used, applies affinity one thread at a time, verifies every write,
+//! and restores earlier changes when a later write fails.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use nix::sched::{sched_getaffinity, sched_setaffinity, CpuSet};
+use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 
 const MAX_CPU_LIST_BYTES: usize = 16 * 1024;
 const MAX_CPU_LIST_VALUES: usize = 4096;
 const MAX_CPU_LIST_EXPANSION: u64 = 65_536;
+const THREAD_GROUP_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+const THREAD_GROUP_STOP_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CpuAffinityRequest {
@@ -48,6 +53,7 @@ impl CpuAffinityError {
 struct ThreadInfo {
     tid: i32,
     comm: String,
+    state: char,
     starttime: u64,
 }
 
@@ -70,9 +76,14 @@ impl ThreadInfo {
         }
 
         // `fields` starts at field 3 (`state`); starttime is field 22.
+        let mut fields = fields.split_whitespace();
+        let raw_state = fields.next().context("thread stat has no state field")?;
+        let state = match raw_state.as_bytes() {
+            [state] => char::from(*state),
+            _ => bail!("invalid thread state {raw_state:?}"),
+        };
         let raw_starttime = fields
-            .split_whitespace()
-            .nth(19)
+            .nth(18)
             .context("thread stat has no starttime field")?;
         let starttime = raw_starttime
             .parse()
@@ -81,8 +92,13 @@ impl ThreadInfo {
         Ok(Self {
             tid,
             comm: comm.to_owned(),
+            state,
             starttime,
         })
+    }
+
+    fn is_stopped(&self) -> bool {
+        matches!(self.state, 'T' | 't')
     }
 
     /// Re-read starttime around numeric-TID syscalls to narrow the window in
@@ -119,6 +135,66 @@ impl ThreadInfo {
     }
 }
 
+/// Keeps a process-wide SIGSTOP paired with SIGCONT on every normal unwind
+/// path. The explicit `resume` call reports delivery failures; `Drop` is a
+/// final best-effort safeguard for early returns and panics.
+struct StoppedThreadGroup {
+    pid: Pid,
+    resumed: bool,
+}
+
+impl StoppedThreadGroup {
+    fn stop(pid: i32) -> Result<Self> {
+        let pid = Pid::from_raw(pid);
+        kill(pid, Signal::SIGSTOP)
+            .with_context(|| format!("failed to send SIGSTOP to Firecracker pid {pid}"))?;
+
+        let guard = Self {
+            pid,
+            resumed: false,
+        };
+        let started = Instant::now();
+        loop {
+            let threads = list_threads(pid.as_raw())
+                .with_context(|| format!("failed to confirm that Firecracker pid {pid} stopped"))?;
+            if threads.iter().all(ThreadInfo::is_stopped) {
+                return Ok(guard);
+            }
+
+            let elapsed = started.elapsed();
+            if elapsed >= THREAD_GROUP_STOP_TIMEOUT {
+                let active = threads
+                    .iter()
+                    .filter(|thread| !thread.is_stopped())
+                    .map(|thread| format!("{}:{:?}:{}", thread.tid, thread.comm, thread.state))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "Firecracker pid {pid} did not fully stop within {} ms; active threads: {active}",
+                    THREAD_GROUP_STOP_TIMEOUT.as_millis()
+                );
+            }
+
+            std::thread::sleep(THREAD_GROUP_STOP_POLL_INTERVAL);
+        }
+    }
+
+    fn resume(mut self) -> Result<()> {
+        kill(self.pid, Signal::SIGCONT)
+            .with_context(|| format!("failed to send SIGCONT to Firecracker pid {}", self.pid))?;
+        self.resumed = true;
+        Ok(())
+    }
+}
+
+impl Drop for StoppedThreadGroup {
+    fn drop(&mut self) {
+        if !self.resumed {
+            let _ = kill(self.pid, Signal::SIGCONT);
+        }
+    }
+}
+
 pub(crate) fn bind_process(
     pid: i32,
     request: CpuAffinityRequest,
@@ -141,24 +217,7 @@ pub(crate) fn bind_process(
     }
 
     let vcpu = request.vcpu.trim().to_owned();
-    let core = request.core.trim().to_owned();
-    let threads = list_threads(pid)
-        .with_context(|| format!("failed to enumerate threads of Firecracker pid {pid}"))
-        .map_err(CpuAffinityError::Operation)?;
-    let process = threads
-        .iter()
-        .find(|thread| thread.tid == pid)
-        .ok_or_else(|| {
-            CpuAffinityError::Operation(anyhow!(
-                "Firecracker pid {pid} has no process-leader thread"
-            ))
-        })?;
-    process
-        .verify_identity(pid)
-        .context("failed to verify Firecracker process identity")
-        .map_err(CpuAffinityError::Operation)?;
-    let targets = select_threads(pid, &vcpu, &threads)?;
-
+    let core = request.core.trim();
     // nix::CpuSet wraps libc's fixed-size cpu_set_t. On supported Linux
     // targets, this limits CPU IDs to 0-1023.
     let max_cpu = CpuSet::count()
@@ -168,7 +227,7 @@ pub(crate) fn bind_process(
             u32::try_from(value).context("cpu_set_t exceeds supported CPU identifiers")
         })
         .map_err(CpuAffinityError::Operation)?;
-    let requested = parse_cpu_list(&core, max_cpu)
+    let requested = parse_cpu_list(core, max_cpu)
         .with_context(|| format!("invalid core value {core:?}"))
         .map_err(CpuAffinityError::invalid)?;
 
@@ -199,7 +258,52 @@ pub(crate) fn bind_process(
     }
 
     let cores = format_cpu_list(&cores);
-    bind_threads(pid, process, &targets, &desired, &cores).map_err(CpuAffinityError::Operation)?;
+    let stopped = StoppedThreadGroup::stop(pid)
+        .context("failed to stop Firecracker for CPU-affinity update")
+        .map_err(CpuAffinityError::Operation)?;
+    let outcome = bind_stopped_process(pid, vcpu, cores, ignored, &desired);
+
+    if let Err(error) = stopped.resume() {
+        let context = match &outcome {
+            Ok(_) => "CPU affinity was applied, but Firecracker could not be resumed".to_string(),
+            Err(bind_error) => format!(
+                "CPU-affinity operation failed ({bind_error:#}); Firecracker also could not be resumed"
+            ),
+        };
+        return Err(CpuAffinityError::Operation(error.context(context)));
+    }
+
+    outcome
+}
+
+/// Enumerate and update tasks only after the complete thread group has entered
+/// a stopped state. This prevents normal Firecracker execution from exiting a
+/// worker and reusing its numeric TID during the affinity syscalls.
+fn bind_stopped_process(
+    pid: i32,
+    vcpu: String,
+    cores: String,
+    ignored: Vec<u32>,
+    desired: &CpuSet,
+) -> std::result::Result<CpuAffinityOutcome, CpuAffinityError> {
+    let threads = list_threads(pid)
+        .with_context(|| format!("failed to enumerate threads of Firecracker pid {pid}"))
+        .map_err(CpuAffinityError::Operation)?;
+    let process = threads
+        .iter()
+        .find(|thread| thread.tid == pid)
+        .ok_or_else(|| {
+            CpuAffinityError::Operation(anyhow!(
+                "Firecracker pid {pid} has no process-leader thread"
+            ))
+        })?;
+    process
+        .verify_identity(pid)
+        .context("failed to verify Firecracker process identity")
+        .map_err(CpuAffinityError::Operation)?;
+    let targets = select_threads(pid, &vcpu, &threads)?;
+
+    bind_threads(pid, process, &targets, desired, &cores).map_err(CpuAffinityError::Operation)?;
     let bound_thread_count = u32::try_from(targets.len())
         .context("bound thread count does not fit in u32")
         .map_err(CpuAffinityError::Operation)?;
@@ -466,8 +570,8 @@ fn format_cpu_set(set: &CpuSet) -> String {
     format_cpu_list(&cpus)
 }
 
-/// Apply affinity as a best-effort transaction: preflight every target, update
-/// one by one, verify the result, and roll back earlier updates on failure.
+/// While the caller keeps the complete thread group stopped, apply affinity as
+/// a best-effort transaction and roll back earlier updates on failure.
 fn bind_threads(
     pid: i32,
     process: &ThreadInfo,
@@ -618,6 +722,8 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
 
+    const AFFINITY_TEST_WORKERS: [&str; 2] = ["aenv-affinity-0", "aenv-affinity-1"];
+
     struct ChildGuard(Child);
 
     impl Drop for ChildGuard {
@@ -631,7 +737,23 @@ mod tests {
         ThreadInfo {
             tid,
             comm: comm.to_string(),
+            state: 'S',
             starttime: 1,
+        }
+    }
+
+    fn wait_until_running(pid: i32) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let threads = list_threads(pid).unwrap();
+            if threads.iter().all(|thread| !thread.is_stopped()) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "test process remained stopped after SIGCONT"
+            );
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -713,6 +835,7 @@ mod tests {
         let stat = "123 (worker ) name) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 987";
         let thread = ThreadInfo::from_stat(123, stat).unwrap();
         assert_eq!(thread.comm, "worker ) name");
+        assert_eq!(thread.state, 'S');
         assert_eq!(thread.starttime, 987);
         assert!(ThreadInfo::from_stat(124, stat).is_err());
     }
@@ -806,7 +929,10 @@ mod tests {
                 panic!("affinity test child exited before it was ready: {status}");
             }
             if let Ok(threads) = list_threads(pid) {
-                if threads.len() >= 3 {
+                let workers_ready = AFFINITY_TEST_WORKERS
+                    .iter()
+                    .all(|name| threads.iter().any(|thread| thread.comm == *name));
+                if workers_ready {
                     break threads;
                 }
             }
@@ -831,6 +957,25 @@ mod tests {
             .find(|&cpu| originals.iter().all(|(_, set)| set.is_set(cpu) == Ok(true)))
             .expect("child threads should share at least one allowed CPU");
 
+        let stopped = StoppedThreadGroup::stop(pid).unwrap();
+        assert!(list_threads(pid)
+            .unwrap()
+            .iter()
+            .all(ThreadInfo::is_stopped));
+        stopped.resume().unwrap();
+        wait_until_running(pid);
+
+        let error = bind_process(
+            pid,
+            CpuAffinityRequest {
+                vcpu: "0".to_string(),
+                core: cpu.to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, CpuAffinityError::Operation(_)));
+        wait_until_running(pid);
+
         let outcome = bind_process(
             pid,
             CpuAffinityRequest {
@@ -840,6 +985,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.bound_thread_count as usize, originals.len());
+        wait_until_running(pid);
 
         let rollback = error_after_rollback(pid, process, "test rollback".to_string(), &originals);
         assert!(rollback.to_string().contains("rolled back"));
@@ -856,13 +1002,17 @@ mod tests {
     #[ignore = "helper process for wildcard_binding_and_rollback_work_on_disposable_process"]
     fn affinity_test_child() {
         let ready = Arc::new(Barrier::new(3));
-        let workers: Vec<_> = (0..2)
-            .map(|_| {
+        let workers: Vec<_> = AFFINITY_TEST_WORKERS
+            .into_iter()
+            .map(|name| {
                 let ready = Arc::clone(&ready);
-                std::thread::spawn(move || {
-                    ready.wait();
-                    std::thread::sleep(Duration::from_secs(30));
-                })
+                std::thread::Builder::new()
+                    .name(name.to_string())
+                    .spawn(move || {
+                        ready.wait();
+                        std::thread::sleep(Duration::from_secs(30));
+                    })
+                    .unwrap()
             })
             .collect();
         ready.wait();
