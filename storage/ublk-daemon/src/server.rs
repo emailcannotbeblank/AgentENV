@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -135,6 +135,10 @@ struct PoolState {
     /// Coalesces asynchronous pool refill work so concurrent acquire/release
     /// requests do not all synchronously create replacement ublk devices.
     refill_inflight: AtomicBool,
+    /// Consecutive refill failures seen while `high_watermark` exceeds
+    /// `ublks_max`; reaching `REFILL_FAILURE_LIMIT` stops refill scheduling.
+    /// Reset to zero on a successful refill.
+    refill_failures: AtomicUsize,
     config: PoolConfig,
     /// Ublk feature flags detected at startup.
     features: u64,
@@ -163,6 +167,7 @@ impl PoolState {
             shared_by_dev_id: DashMap::new(),
             image_locks: DashMap::new(),
             refill_inflight: AtomicBool::new(false),
+            refill_failures: AtomicUsize::new(0),
             config,
             features,
             placeholders: Mutex::new(HashMap::new()),
@@ -1443,13 +1448,26 @@ fn schedule_idle_pool_refill(
     }
 
     tokio::spawn(async move {
-        refill_idle_pool_best_effort(&pool, ctrl_ring.clone(), virtual_size).await;
+        let succeeded = refill_idle_pool_best_effort(&pool, ctrl_ring.clone(), virtual_size).await;
         pool.refill_inflight.store(false, Ordering::Release);
 
         if matches!(
             pool.idle.compute_maintenance_action(pool.idle.len()),
             PoolMaintenanceAction::Fill(_)
         ) {
+            if succeeded {
+                pool.refill_failures.store(0, Ordering::Relaxed);
+            } else if pool_high_watermark_exceeds_ublks_max(&pool) {
+                let failures = pool.refill_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    failures,
+                    giving_up = failures >= REFILL_FAILURE_LIMIT,
+                    "pool refill failed while high_watermark exceeds ublks_max"
+                );
+                if failures >= REFILL_FAILURE_LIMIT {
+                    return;
+                }
+            }
             schedule_idle_pool_refill(pool, ctrl_ring, virtual_size);
         }
     });
@@ -1489,18 +1507,39 @@ async fn refill_idle_pool(
     Ok(())
 }
 
+/// Consecutive refill failures (while `high_watermark` exceeds `ublks_max`)
+/// tolerated before refill scheduling stops.
+const REFILL_FAILURE_LIMIT: usize = 10;
+
+/// Run a refill attempt. Returns whether it created at least one device.
 async fn refill_idle_pool_best_effort(
     pool: &PoolState,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     virtual_size: u64,
-) {
-    if let Err(err) = refill_idle_pool(pool, ctrl_ring, virtual_size).await {
-        tracing::warn!(
-            error = %err,
-            virtual_size,
-            "failed to refill idle overlaybd pool"
-        );
+) -> bool {
+    match refill_idle_pool(pool, ctrl_ring, virtual_size).await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                virtual_size,
+                "failed to refill idle overlaybd pool"
+            );
+            false
+        }
     }
+}
+
+/// Whether the pool `high_watermark` exceeds the kernel's `ublks_max`.
+///
+/// Only a hint: on some kernels the limit caps just unprivileged devices
+/// (CAP_SYS_ADMIN bypasses it), so it is combined with an actual refill
+/// failure counter, never trusted alone.
+fn pool_high_watermark_exceeds_ublks_max(pool: &PoolState) -> bool {
+    std::fs::read_to_string("/sys/module/ublk_drv/parameters/ublks_max")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .is_some_and(|max| pool.idle.config().high_watermark > max)
 }
 
 async fn stop_excess_idle_device(
